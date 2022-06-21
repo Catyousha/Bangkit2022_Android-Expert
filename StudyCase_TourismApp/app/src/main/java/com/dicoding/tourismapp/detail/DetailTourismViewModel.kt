@@ -9,4 +9,3 @@ import com.dicoding.tourismapp.core.domain.usecase.TourismUseCase
 class DetailTourismViewModel(private val tourismUseCase: TourismUseCase) : ViewModel() {
     fun setFavoriteTourism(tourism: Tourism, newStatus:Boolean) = tourismUseCase.setFavoriteTourism(tourism, newStatus)
 }
-

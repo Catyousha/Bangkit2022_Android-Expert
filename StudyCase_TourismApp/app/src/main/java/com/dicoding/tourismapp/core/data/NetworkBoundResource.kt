@@ -1,100 +1,91 @@
 package com.dicoding.tourismapp.core.data
 
-import androidx.lifecycle.LiveData
-import androidx.lifecycle.MediatorLiveData
+import android.annotation.SuppressLint
 import com.dicoding.tourismapp.core.data.source.remote.network.ApiResponse
-
 import com.dicoding.tourismapp.core.utils.AppExecutors
+import io.reactivex.BackpressureStrategy
+import io.reactivex.Flowable
+import io.reactivex.android.schedulers.AndroidSchedulers
+import io.reactivex.disposables.CompositeDisposable
+import io.reactivex.schedulers.Schedulers
+import io.reactivex.subjects.PublishSubject
 
-abstract class NetworkBoundResource<ResultType, RequestType>(
-    private val mExecutors: AppExecutors
-) {
-    // menampung hasil fetch data
-    private val result = MediatorLiveData<Resource<ResultType>>()
+@SuppressLint("CheckResult")
+@Suppress("LeakingThis")
+abstract class NetworkBoundResource<ResultType, RequestType>(private val mExecutors: AppExecutors) {
+  // menampung hasil fetch data
+  private val result = PublishSubject.create<Resource<ResultType>>()
+  private val mCompositeDisposable = CompositeDisposable()
 
-    init {
-        // load data awal
-        result.value = Resource.Loading(null)
-
-        // sumber database
-        @Suppress("LeakingThis")
-        val dbSource = loadFromDB()
-
-        // melakukan mediasi antara data dari db dan api
-        result.addSource(dbSource) { data ->
-            // ilangin sumber db langsung
-            result.removeSource(dbSource)
-
-            // cek apakah harus fetch dari api atau tidak dengan data saat ini
-            if (shouldFetch(data)) {
-                // jika harus fetch, maka fetch dari api
-                fetchFromNetwork(dbSource)
-            } else {
-                // jika tidak harus fetch, maka set hasil dari db
-                result.addSource(dbSource) { newData ->
-                    result.value = Resource.Success(newData)
-                }
+  init {
+    val dbSource = loadFromDB()
+    val db =
+        dbSource
+            .subscribeOn(Schedulers.io())
+            .observeOn(AndroidSchedulers.mainThread())
+            .take(1)
+            .subscribe { value ->
+              dbSource.unsubscribeOn(Schedulers.io())
+              if (shouldFetch(value)) {
+                fetchFromNetwork()
+              } else {
+                result.onNext(Resource.Success(value))
+              }
             }
-        }
-    }
+    mCompositeDisposable.add(db)
+  }
 
-    protected open fun onFetchFailed() {}
+  protected open fun onFetchFailed() {}
 
-    protected abstract fun loadFromDB(): LiveData<ResultType>
-    protected abstract fun shouldFetch(data: ResultType?): Boolean
-    protected abstract fun createCall(): LiveData<ApiResponse<RequestType>>
-    protected abstract fun saveCallResult(data: RequestType)
+  protected abstract fun loadFromDB(): Flowable<ResultType>
+  protected abstract fun shouldFetch(data: ResultType?): Boolean
+  protected abstract fun createCall(): Flowable<ApiResponse<RequestType>>
+  protected abstract fun saveCallResult(data: RequestType)
 
-    // template fetch data dari API
-    private fun fetchFromNetwork(dbSource: LiveData<ResultType>) {
-        val apiResponse = createCall()
+  // template fetch data dari API
+  private fun fetchFromNetwork() {
+    val apiResponse = createCall()
+    result.onNext(Resource.Loading())
 
-        // menambahkan sumber db ke result buat menunggu hasil dari api
-        result.addSource(dbSource) { newData ->
-            result.value = Resource.Loading(newData)
-        }
-
-        // fetch data dari api
-        result.addSource(apiResponse) { response ->
-            // ilangin sumber dari api
-            result.removeSource(apiResponse)
-
-            // ilangin sumber dari db
-            result.removeSource(dbSource)
-
-            when (response) {
-
-                is ApiResponse.Success ->
-                    mExecutors.diskIO().execute {
-                        // simpan hasil api ke db
-                        saveCallResult(response.data)
-
-                        // refresh data dari db dan set sumber data dari db
-                        mExecutors.mainThread().execute {
-                            result.addSource(loadFromDB()) { newData ->
-                                result.value = Resource.Success(newData)
-                            }
-                        }
-                    }
-
-                is ApiResponse.Empty -> mExecutors.mainThread().execute {
-
-                    // refresh data dari db dan set sumber data dari db
-                    result.addSource(loadFromDB()) { newData ->
-                        result.value = Resource.Success(newData)
-                    }
+    val response =
+        apiResponse
+            .subscribeOn(Schedulers.io())
+            .observeOn(AndroidSchedulers.mainThread())
+            .take(1)
+            .doOnComplete { mCompositeDisposable.dispose() }
+            .subscribe { resValue ->
+              when (resValue) {
+                is ApiResponse.Success -> {
+                  saveCallResult(resValue.data)
+                  val dbSource = loadFromDB()
+                  dbSource
+                      .subscribeOn(Schedulers.computation())
+                      .observeOn(AndroidSchedulers.mainThread())
+                      .take(1)
+                      .subscribe {
+                        dbSource.unsubscribeOn(Schedulers.computation())
+                        result.onNext(Resource.Success(it))
+                      }
                 }
-
+                is ApiResponse.Empty -> {
+                  val dbSource = loadFromDB()
+                  dbSource
+                      .subscribeOn(Schedulers.computation())
+                      .observeOn(AndroidSchedulers.mainThread())
+                      .take(1)
+                      .subscribe {
+                        dbSource.unsubscribeOn(Schedulers.computation())
+                        result.onNext(Resource.Success(it))
+                      }
+                }
                 is ApiResponse.Error -> {
-                    onFetchFailed()
-                    result.addSource(dbSource) { newData ->
-                        result.value = Resource.Error(response.errorMessage, newData)
-                    }
+                  onFetchFailed()
+                  result.onNext(Resource.Error(resValue.errorMessage, null))
                 }
-
+              }
             }
-        }
-    }
+    mCompositeDisposable.add(response)
+  }
 
-    fun asLiveData(): LiveData<Resource<ResultType>> = result
+  fun asFlowable(): Flowable<Resource<ResultType>> = result.toFlowable(BackpressureStrategy.BUFFER)
 }
